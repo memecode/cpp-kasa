@@ -3,6 +3,12 @@
 #include "lgi/common/Lgi.h"
 #include "lgi/common/Net.h"
 
+struct LKasaDevice
+{
+    LString Ip;
+    LString Response; // Json
+};
+
 class LKasaProtocol
 {
     LSocket Socket;
@@ -22,6 +28,9 @@ public:
     void Disconnect();
     bool IsConnected() const;
     LError GetLastError() const;
+
+    // A null target probes each usable interface's directed broadcast address.
+    bool Discover(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 2000);
 
     // Sends an IOT JSON command and returns the decrypted response JSON.
     bool Request(const char *requestJson, LString &responseJson);

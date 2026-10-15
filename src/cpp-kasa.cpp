@@ -55,6 +55,120 @@ LError LKasaProtocol::GetLastError() const
 	return LastError;
 }
 
+bool LKasaProtocol::Discover(LArray<LKasaDevice> &devices, const char *targetIp, int timeoutMs)
+{
+	devices.Length(0);
+	LastError.Empty();
+	if (timeoutMs <= 0)
+	{
+		LastError.Set(LErrorInvalidParam, "Discovery timeout must be positive");
+		return false;
+	}
+
+	LSocket discoverySocket;
+	discoverySocket.SetBroadcast(true);
+	discoverySocket.SetUdp(true);
+
+	LString probe = "{\"system\":{\"get_sysinfo\":{}}}";
+	LString encryptedProbe = XorEncrypt(probe.Get(), probe.Length());
+	int sent = 0;
+	if (targetIp)
+	{
+		uint32_t target = LHostnameToIp(targetIp);
+		if (!target)
+		{
+			LastError.Set(LErrorInvalidParam, "Invalid discovery target");
+			return false;
+		}
+		sent = discoverySocket.WriteUdp(encryptedProbe.Get(), (int)encryptedProbe.Length(), 0, target, DefaultPort) > 0;
+	}
+	else
+	{
+		LArray<LSocket::Interface> interfaces;
+		if (!LSocket::EnumInterfaces(interfaces))
+		{
+			LastError.Set(LErrorFuncFailed, "Unable to enumerate network interfaces");
+			return false;
+		}
+
+		LArray<uint32_t> broadcastIps;
+		for (auto &interface: interfaces)
+		{
+			if (!interface.Ip4 || !interface.Netmask4 || interface.IsLoopBack())
+				continue;
+
+			uint32_t broadcastIp = interface.Ip4 | ~interface.Netmask4;
+			// LSocket treats 255.255.255.255 as its INADDR_ANY sentinel.
+			if (broadcastIp == 0xffffffff || broadcastIp == interface.Ip4)
+				continue;
+
+			bool duplicate = false;
+			for (auto existing: broadcastIps)
+				if (existing == broadcastIp)
+					duplicate = true;
+			if (duplicate)
+				continue;
+
+			broadcastIps.New() = broadcastIp;
+			if (discoverySocket.WriteUdp(encryptedProbe.Get(), (int)encryptedProbe.Length(), 0,
+				broadcastIp, DefaultPort) > 0)
+				sent++;
+		}
+	}
+
+	if (!sent)
+	{
+		LastError = discoverySocket.GetError();
+		if (!LastError)
+			LastError.Set(LErrorFuncFailed, "Unable to send discovery probe");
+		return false;
+	}
+
+	const uint64_t deadline = LCurrentTime() + timeoutMs;
+	std::string datagram(65507, '\0');
+	while (true)
+	{
+		uint64_t now = LCurrentTime();
+		if (now >= deadline)
+			break;
+
+		int waitMs = (int)(deadline - now);
+		if (!discoverySocket.IsReadable(waitMs))
+			break;
+
+		uint32_t sourceIp = 0;
+		uint16_t sourcePort = 0;
+		int received = discoverySocket.ReadUdp(datagram.data(), (int)datagram.size(), 0,
+			&sourceIp, &sourcePort);
+		if (received <= 0 || !sourceIp)
+			continue;
+
+		LString plaintext = XorDecrypt(datagram.data(), (size_t)received);
+		LJson response;
+		if (!response.SetJson(plaintext.Get()))
+			continue;
+
+		LString ip = LIpToStr(sourceIp);
+		bool duplicate = false;
+		for (auto &device: devices)
+			if (device.Ip == ip)
+				duplicate = true;
+		if (duplicate)
+			continue;
+
+		auto &device = devices.New();
+		device.Ip = ip;
+		device.Response = plaintext;
+	}
+
+	if (!devices.Length())
+	{
+		LastError.Set(LErrorTimedOut, "No legacy devices replied before the timeout");
+		return false;
+	}
+	return true;
+}
+
 bool LKasaProtocol::WriteAll(const void *data, size_t size)
 {
 	const auto *bytes = static_cast<const uint8_t *>(data);
