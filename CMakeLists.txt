@@ -3,6 +3,8 @@ project(cpp-kasa)
 
 set(CMAKE_CXX_STANDARD 17)
 
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 set(LGI_LIB_ONLY TRUE)
 add_subdirectory(../lgi/trunk lgi)
 
@@ -16,7 +18,9 @@ target_include_directories(cpp-kasa
     
 target_link_libraries(cpp-kasa
     PUBLIC
-        lgi)
+        lgi
+    PRIVATE
+        OpenSSL::Crypto)
 
 # utility executable:
 add_executable(util

@@ -3,6 +3,7 @@
 // Can discover and interact with Kasa devices on the network.
 // Usage:
 //   util discover
+//   util discover-modern
 //   util get <ip|deviceName>
 //   util set <ip|deviceName> <on|off>
 
@@ -26,6 +27,7 @@ namespace
 	{
 		std::cerr << "Usage:\n"
 			<< "  " << name << " discover\n"
+			<< "  " << name << " discover-modern\n"
 			<< "  " << name << " get <ip|deviceName>\n"
 			<< "  " << name << " set <ip|deviceName> <on|off>\n";
 	}
@@ -51,6 +53,19 @@ int main(int argc, char **argv)
 	{
 		LArray<LKasaDevice> devices;
 		if (!protocol.Discover(devices))
+		{
+			PrintError(protocol);
+			return 1;
+		}
+
+		for (auto &device: devices)
+			std::cout << device.Ip.Get() << '\n' << PrettyJson(device.Response).Get() << "\n\n";
+		return 0;
+	}
+	if (strcmp(command, "discover-modern") == 0 && argc == 2)
+	{
+		LArray<LKasaDevice> devices;
+		if (!protocol.DiscoverModern(devices))
 		{
 			PrintError(protocol);
 			return 1;

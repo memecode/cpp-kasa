@@ -29,8 +29,11 @@ public:
     bool IsConnected() const;
     LError GetLastError() const;
 
-    // A null target probes each usable interface's directed broadcast address.
-    bool Discover(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 2000);
+    // Probes both legacy and modern discovery backends; each gets its own timeout.
+    bool Discover(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
+    // Protocol-specific discovery for callers that only need legacy XOR devices.
+    bool DiscoverLegacy(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
+    bool DiscoverModern(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
 
     // Sends an IOT JSON command and returns the decrypted response JSON.
     bool Request(const char *requestJson, LString &responseJson);
