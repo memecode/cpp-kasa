@@ -21,10 +21,11 @@ implemented. The protocol reference is in [docs/kasa-protocol.md](docs/kasa-prot
 
 ## Dependencies
 
-- CMake 3.20 or newer
-- A C++17 compiler
-- OpenSSL Crypto development files
-- The Lgi source tree at `../lgi/trunk`, relative to this project directory
+- [CMake](https://github.com/kitware/cmake) 3.20 or newer.
+- A C++17 compiler.
+- [OpenSSL](https://www.openssl.org/) Crypto development files.
+- The [Lgi](https://github.com/memecode/lgi) source tree at `../lgi/trunk`,
+  relative to this project directory.
 
 Lgi's platform-specific build dependencies are also required. On Linux, this
 project builds Lgi's GTK backend and therefore needs its development packages
@@ -52,7 +53,7 @@ util set <ip|deviceName> <on|off>
 ```
 
 `discover` runs both discovery backends. `discover-modern` runs only modern TDP
-discovery. Device replies are printed as JSON with two-space indentation. The
+discovery. Device replies are pretty printed as JSON. The
 `get` and `set` commands use the legacy XOR control transport; `set` sets the
 relay to an explicit state.
 
@@ -75,13 +76,13 @@ LArray<LKasaDevice> devices;
 
 if (kasa.Discover(devices))
 {
-		for (auto &device : devices)
-				printf("%s: %s\n", device.Ip.Get(), device.Response.Get());
+    for (auto &device : devices)
+        printf("%s: %s\n", device.Ip.Get(), device.Response.Get());
 }
 
 LString response;
 if (kasa.Connect("192.168.1.50") && kasa.GetSysInfo(response))
-		printf("%s\n", response.Get());
+    printf("%s\n", response.Get());
 ```
 
 `Discover()` uses directed broadcast addresses when no target is supplied, or
