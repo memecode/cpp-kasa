@@ -90,15 +90,6 @@ namespace
 	}
 }
 
-LKasaProtocol::LKasaProtocol()
-{
-}
-
-LKasaProtocol::~LKasaProtocol()
-{
-	Disconnect();
-}
-
 bool LKasaProtocol::Connect(const char *host, int port, int timeoutMs)
 {
 	Disconnect();
@@ -125,11 +116,12 @@ void LKasaProtocol::Disconnect()
 {
 	if (Socket.IsOpen())
 		Socket.Close();
+	ClearSmartSession();
 }
 
 bool LKasaProtocol::IsConnected() const
 {
-	return const_cast<LSocket &>(Socket).IsOpen();
+	return const_cast<LSocket &>(Socket).IsOpen() || HasSmartSession();
 }
 
 LError LKasaProtocol::GetLastError() const

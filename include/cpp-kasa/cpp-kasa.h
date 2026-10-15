@@ -3,19 +3,27 @@
 #include "lgi/common/Lgi.h"
 #include "lgi/common/Net.h"
 
+#include <memory>
+
 struct LKasaDevice
 {
     LString Ip;
     LString Response; // Json
 };
 
+struct LKasaSmartSession;
+
 class LKasaProtocol
 {
     LSocket Socket;
     LError LastError;
+    std::unique_ptr<LKasaSmartSession> Smart;
 
     bool WriteAll(const void *data, size_t size);
     bool ReadAll(void *data, size_t size);
+    bool SmartRequest(const char *method, const char *paramsJson, LString &responseJson);
+    bool HasSmartSession() const;
+    void ClearSmartSession();
 
 public:
     static constexpr int DefaultPort = 9999;
@@ -39,6 +47,14 @@ public:
     bool Request(const char *requestJson, LString &responseJson);
     bool GetSysInfo(LString &responseJson);
     bool SetRelayState(bool on, LString &responseJson);
+
+    // Connect to a discovered standard SMART switch using its advertised AES or KLAP transport.
+    bool ConnectSmart(const LKasaDevice &device, const char *username, const char *password,
+        int timeoutMs = 5000);
+    bool ConnectSmart(const char *host, const char *username, const char *password,
+        int timeoutMs = 5000);
+    bool GetDeviceInfo(LString &responseJson);
+    bool SetDeviceOn(bool on, LString &responseJson);
 
     // Each message starts with state 0xAB; decryption advances on ciphertext.
     static LString XorEncrypt(const void *data, size_t size);

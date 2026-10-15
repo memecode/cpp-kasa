@@ -6,6 +6,8 @@
 //   util discover-modern
 //   util get <ip|deviceName>
 //   util set <ip|deviceName> <on|off>
+//   util smart-get <ip|deviceName> <username> <password>
+//   util smart-set <ip|deviceName> <username> <password> <on|off>
 
 #include "cpp-kasa/cpp-kasa.h"
 #include "lgi/common/Json.h"
@@ -29,7 +31,9 @@ namespace
 			<< "  " << name << " discover\n"
 			<< "  " << name << " discover-modern\n"
 			<< "  " << name << " get <ip|deviceName>\n"
-			<< "  " << name << " set <ip|deviceName> <on|off>\n";
+			<< "  " << name << " set <ip|deviceName> <on|off>\n"
+			<< "  " << name << " smart-get <ip|deviceName> <username> <password>\n"
+			<< "  " << name << " smart-set <ip|deviceName> <username> <password> <on|off>\n";
 	}
 
 	void PrintError(const LKasaProtocol &protocol)
@@ -73,6 +77,38 @@ int main(int argc, char **argv)
 
 		for (auto &device: devices)
 			std::cout << device.Ip.Get() << '\n' << PrettyJson(device.Response).Get() << "\n\n";
+		return 0;
+	}
+	if ((strcmp(command, "smart-get") == 0 && argc == 5) ||
+		(strcmp(command, "smart-set") == 0 && argc == 6))
+	{
+		bool isSet = strcmp(command, "smart-set") == 0;
+		bool on = false;
+		if (isSet)
+		{
+			if (strcmp(argv[5], "on") == 0)
+				on = true;
+			else if (strcmp(argv[5], "off") != 0)
+			{
+				PrintUsage(argv[0]);
+				return 2;
+			}
+		}
+		if (!protocol.ConnectSmart(argv[2], argv[3], argv[4]))
+		{
+			PrintError(protocol);
+			return 1;
+		}
+		LString response;
+		bool success = isSet
+			? protocol.SetDeviceOn(on, response)
+			: protocol.GetDeviceInfo(response);
+		if (!success)
+		{
+			PrintError(protocol);
+			return 1;
+		}
+		std::cout << PrettyJson(response).Get() << '\n';
 		return 0;
 	}
 
