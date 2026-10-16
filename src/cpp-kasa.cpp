@@ -123,6 +123,8 @@ bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, const
 	int timeoutMs = GetTimeout();
 	Pending.emplace_back([this, operation = std::move(operation), onComplete, timeoutMs]()
 	{
+		if (CancelState->IsCancelled())
+			return;
 		LString response;
 		bool success = false;
 		LastError.Empty();
@@ -146,7 +148,7 @@ bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, const
 			PublishedError = CopyError(LastError);
 			Connected = Socket.IsOpen() || HasSmartSession();
 		}
-		if (onComplete)
+		if (onComplete && !CancelState->IsCancelled())
 			onComplete(success, response);
 	});
 	QueueReady.notify_one();
@@ -161,7 +163,7 @@ void LKasaProtocol::WorkerLoop()
 		{
 			std::unique_lock<std::mutex> lock(QueueMutex);
 			QueueReady.wait(lock, [this]() { return Stopping || !Pending.empty(); });
-			if (Pending.empty())
+			if (Stopping || Pending.empty())
 				return;
 			operation = std::move(Pending.front());
 			Pending.pop_front();
@@ -222,8 +224,7 @@ void LKasaProtocol::Disconnect()
 
 void LKasaProtocol::DisconnectSync()
 {
-	if (Socket.IsOpen())
-		Socket.Close();
+	Socket.Close();
 	ClearSmartSession();
 }
 
@@ -252,32 +253,6 @@ bool LKasaProtocol::Discover(const TDeviceCb &onDevice, const char *targetIp,
 	}, onComplete);
 }
 
-bool LKasaProtocol::DiscoverLegacy(const TDeviceCb &onDevice, const char *targetIp,
-	const TStatusCb &onComplete)
-{
-	if (!onDevice)
-		return false;
-	std::string target = targetIp ? targetIp : "";
-	bool directed = targetIp != nullptr;
-	return Enqueue([=](LString &, int timeoutMs)
-	{
-		return DiscoverLegacySync(onDevice, directed ? target.c_str() : nullptr, timeoutMs);
-	}, onComplete);
-}
-
-bool LKasaProtocol::DiscoverModern(const TDeviceCb &onDevice, const char *targetIp,
-	const TStatusCb &onComplete)
-{
-	if (!onDevice)
-		return false;
-	std::string target = targetIp ? targetIp : "";
-	bool directed = targetIp != nullptr;
-	return Enqueue([=](LString &, int timeoutMs)
-	{
-		return DiscoverModernSync(onDevice, directed ? target.c_str() : nullptr, timeoutMs);
-	}, onComplete);
-}
-
 bool LKasaProtocol::DiscoverSync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs)
 {
 	LastError.Empty();
@@ -293,6 +268,8 @@ bool LKasaProtocol::DiscoverSync(const TDeviceCb &onDevice, const char *targetIp
 	auto deliver = [&](const LKasaDevice &device, bool modern)
 	{
 		std::lock_guard<std::mutex> lock(callbackMutex);
+		if (CancelState->IsCancelled())
+			return;
 		for (auto &ip: modernIps)
 			if (ip == device.Ip)
 				return;
@@ -303,6 +280,12 @@ bool LKasaProtocol::DiscoverSync(const TDeviceCb &onDevice, const char *targetIp
 	};
 	LKasaProtocol legacyProtocol;
 	LKasaProtocol modernProtocol;
+	legacyProtocol.CancelState = CancelState;
+	modernProtocol.CancelState = CancelState;
+	legacyProtocol.OwnsCancellation = false;
+	modernProtocol.OwnsCancellation = false;
+	legacyProtocol.Socket.SetCancel(CancelState.get());
+	modernProtocol.Socket.SetCancel(CancelState.get());
 	bool foundLegacy = false;
 	bool foundModern = false;
 	LError legacyError;
@@ -372,6 +355,7 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 	LArray<LString> discoveredIps;
 
 	LSocket discoverySocket;
+	discoverySocket.SetCancel(CancelState.get());
 	discoverySocket.SetBroadcast(true);
 	discoverySocket.SetUdp(true);
 
@@ -432,15 +416,15 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 
 	const uint64_t deadline = LCurrentTime() + timeoutMs;
 	std::string datagram(65507, '\0');
-	while (true)
+	while (!CancelState->IsCancelled())
 	{
 		uint64_t now = LCurrentTime();
 		if (now >= deadline)
 			break;
 
 		int waitMs = (int)(deadline - now);
-		if (!discoverySocket.IsReadable(waitMs))
-			break;
+		if (!discoverySocket.IsReadable(MIN(waitMs, 50)))
+			continue;
 
 		uint32_t sourceIp = 0;
 		uint16_t sourcePort = 0;
@@ -466,7 +450,8 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 		LKasaDevice device;
 		device.Ip = ip;
 		device.Response = plaintext;
-		onDevice(device);
+		if (!CancelState->IsCancelled())
+			onDevice(device);
 	}
 
 	if (!discoveredIps.Length())
@@ -537,6 +522,7 @@ bool LKasaProtocol::DiscoverModernSync(const TDeviceCb &onDevice, const char *ta
 	}
 
 	LSocket discoverySocket;
+	discoverySocket.SetCancel(CancelState.get());
 	discoverySocket.SetBroadcast(true);
 	discoverySocket.SetUdp(true);
 	int sent = 0;
@@ -546,7 +532,7 @@ bool LKasaProtocol::DiscoverModernSync(const TDeviceCb &onDevice, const char *ta
 	int roundsSent = 0;
 	std::string datagram(65507, '\0');
 
-	while (true)
+	while (!CancelState->IsCancelled())
 	{
 		uint64_t now = LCurrentTime();
 		while (roundsSent < 3 && now >= nextRound)
@@ -564,7 +550,7 @@ bool LKasaProtocol::DiscoverModernSync(const TDeviceCb &onDevice, const char *ta
 
 		uint64_t wakeAt = roundsSent < 3 ? MIN(nextRound, deadline) : deadline;
 		int waitMs = (int)(wakeAt > now ? wakeAt - now : 0);
-		if (!discoverySocket.IsReadable(waitMs))
+		if (!discoverySocket.IsReadable(MIN(waitMs, 50)))
 			continue;
 
 		uint32_t sourceIp = 0;
@@ -592,7 +578,8 @@ bool LKasaProtocol::DiscoverModernSync(const TDeviceCb &onDevice, const char *ta
 		LKasaDevice device;
 		device.Ip = ip;
 		device.Response = responseJson;
-		onDevice(device);
+		if (!CancelState->IsCancelled())
+			onDevice(device);
 	}
 
 	if (!sent)

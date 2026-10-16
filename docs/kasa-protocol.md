@@ -23,6 +23,7 @@ client port and keep that socket open while collecting replies.
 | Legacy XOR control | TCP | 9999 | 4-byte length + XOR JSON |
 | AES control | HTTP over TCP | 80 | POST `/app` |
 | KLAP v1 or v2 control | HTTP over TCP | 80 | POST `/app/handshake1`, `/app/handshake2`, `/app/request` |
+| TPAP, supported C++ profile | HTTP over TCP | 80 | POST `/` for login; `/stok=<session>/ds` for binary AEAD frames |
 | HTTPS KLAP control | HTTPS over TCP | 4433 | Same KLAP endpoints |
 | Camera / hub SSL-AES | HTTPS over TCP | 443 | POST `/`, then `/stok=<token>/ds` |
 | Older robovac SSL | HTTPS over TCP | 4433 | POST `/app`, then `/app?token=<token>` |
@@ -48,11 +49,184 @@ These are supported combinations, not an instruction to blindly try every
 transport against every device. Prefer discovery and handle unknown combinations
 explicitly. Firmware updates can change the transport.
 
+## TPAP: Local Reference Findings
+
+The local audit below remains valid, but a separate upstream implementation was
+subsequently located in [python-kasa PR #1592](https://github.com/python-kasa/python-kasa/pull/1592).
+The C++ profile described here follows
+[tpaptransport.py at e7084472972f08f2e2235b342f3964aedbfaeb3b](https://github.com/ZeliardM/python-kasa/blob/e7084472972f08f2e2235b342f3964aedbfaeb3b/kasa/transports/tpaptransport.py),
+not the local `master` checkout. That PR is unmerged and is not a vendor specification.
+
+Reference audit: local `python-kasa` branch `master`, commit
+`2a81f74e9ca8aeb212d1f3fd66e03949ec1bd8e4`, inspected on 2026-10-16.
+These findings describe that revision, not every upstream branch or future release.
+
+The checked-out `python-kasa` source does **not** currently implement a TPAP
+transport. Its [0.11.0.1 release notes](../../python-kasa/CHANGELOG.md) explicitly
+state that TPAP did not make that release. The
+[encryption enum](../../python-kasa/kasa/deviceconfig.py) and
+[transport factory](../../python-kasa/kasa/device_factory.py) have no TPAP
+selection, and there is no TPAP module in the checked-out transport directory.
+TPAP mentions in comments or device fixtures are not evidence of an implemented
+authentication exchange.
+
+The relevant partial references are:
+
+- [credentials.py](../../python-kasa/kasa/credentials.py),
+	`Credentials._from_plaintext_hash()`, mentions SSL-AES and TPAP in a comment.
+	It can recover `un` and `pwd` strings from Base64-encoded JSON stored as a
+	credentials hash. This is a stored-credential compatibility helper, not the
+	TPAP wire encoding, password derivation, or authentication handshake.
+- [credential compatibility tests](../../python-kasa/tests/transports/test_credentials_hash.py)
+	exercise reuse of that stored format by other transports. They do not test a
+	TPAP transport or exchange with a TPAP device.
+- The [P125M fixture](../../python-kasa/tests/fixtures/smart/P125M(US)_1.0_1.4.4.json)
+	advertises a `tpap` component but has `tpap_preferred: false` and
+	`mgt_encrypt_schm.encrypt_type: "KLAP"`. A TPAP capability does not mean TPAP
+	was used to obtain the fixture, nor prove KLAP works when a different device
+	advertises TPAP as its selected encryption type.
+
+### Discovery Versus Authentication
+
+A device may advertise `result.mgt_encrypt_schm.encrypt_type` as `"TPAP"`, with
+an HTTP port, login version, `tpap_preferred`, and a `tpap` object containing
+fields such as `tls`, `dac`, `noc`, `pake`, and `port`. These are discovery
+metadata, not a handshake transcript. In particular, `pake: ["2"]` does not
+establish the PAKE algorithm, group, password derivation, message encoding,
+key derivation, proof validation, or authenticated request framing.
+
+Do not substitute AES or KLAP solely because the device is a SMART plug, uses
+port 80, or advertises login version 2. A working fallback would need separate
+evidence from a device or reference implementation. The TPAP discovery metadata
+alone also does not establish a need for TLS or a new C++ dependency.
+
+### Display Names
+
+For supported SMART transports, the
+[device update path](../../python-kasa/kasa/smart/smartdevice.py) obtains device
+information with `get_device_info`; its `alias` property Base64-decodes the
+`nickname` field as UTF-8. This is the friendly name, rather than the model,
+MAC address, device ID, or account-owner hash.
+
+If a discovery response omits a friendly name, there is no name to extract from
+that response. An authenticated device-info request is the established path
+for supported SMART devices. C++ now supports that query over the TPAP profile
+below. Response JSON remains unchanged: decode `result.nickname` from Base64 to
+UTF-8 to display the name. UDP discovery still cannot populate a name the device
+did not advertise.
+
+### Implemented C++ TPAP Profile
+
+Supported devices use HTTP (`tls: 0`), no DAC (`dac: 0` or `false`), and
+account-password authentication (`pake` contains `2`). C++ offers only suite 1
+(P-256/SHA256/HMAC-SHA256) with `aes_128_ccm`. This matches the reported P110
+discovery profile, but still needs physical-device verification. Existing
+OpenSSL provides all required primitives; no new dependency is introduced.
+
+#### Login
+
+POST `{"method":"login","params":{"sub_method":"discover"}}` to `/`.
+Validate the returned `result.tpap` metadata and use its advertised HTTP `port`
+for subsequent messages. Do not silently ignore TLS or DAC requirements.
+
+Generate 32 random bytes for `user_random` and Base64-encode them. POST to `/`:
+
+```json
+{"method":"login","params":{"sub_method":"pake_register","username":"<hash of admin>","user_random":"<Base64>","cipher_suites":[1],"encryption":["aes_128_ccm"],"passcode_type":"userpw","stok":null}}
+```
+
+The registration username is lowercase hexadecimal MD5 of literal `admin`, or
+uppercase hexadecimal SHA256 of `admin` when HTTP discovery reports
+`user_hash_type: 1`. It is not the account email. Account credentials are used
+in the password derivation below.
+
+The register reply must contain Base64 `dev_random`, `dev_salt`, `dev_share`,
+`cipher_suites: 1`, positive `iterations`, and `encryption: "aes_128_ccm"`.
+C++ caps iterations at 1,000,000. Normally the credential input is UTF-8
+`username/password`, or just the password when the username is empty.
+Supported `extra_crypt` transformations are:
+
+- `password_shadow` ID 2: lowercase SHA1 hex of the password.
+- `password_shadow` ID 3: lowercase SHA1 hex of lowercase MD5 hex of the account
+	username, followed by `_` and the uppercase colon-separated MAC.
+- `password_sha_with_salt`: lowercase SHA256 hex of `admin` when `sha_name == 0`,
+	otherwise `user`, followed by Base64-decoded `sha_salt` and the password.
+
+Unsupported credential transformations fail explicitly. The stored Base64
+credential hashes mentioned in the local Python checkout are not this wire format.
+
+#### PAKE and Confirmation
+
+Use uncompressed SEC1 point encodings in the transcript. Validate peer points
+on P-256 and reject infinity. Let `q` be the curve order and `G` its generator.
+The fixed points, written here as compressed SEC1, are:
+
+```text
+M = 02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f
+N = 03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49
+
+derived = PBKDF2-HMAC-SHA256(credential UTF-8, decoded dev_salt, iterations, 80 bytes)
+w0      = big_endian_integer(derived[0:40]) mod q
+w1      = big_endian_integer(derived[40:80]) mod q
+x       = fresh random scalar in [1, q-1]
+L       = x*G + w0*M
+R       = decoded dev_share
+Rprime  = R - w0*N
+Z       = x*Rprime
+V       = w1*Rprime
+context = SHA256(ASCII("PAKE V1") || decoded user_random || decoded dev_random)
+```
+
+Encode `w0` as minimal unsigned big-endian bytes (`00` for zero). Match the
+reference's special rule: if its byte length is odd and the top bit is set,
+prepend `00`. Define `LP(data)` as eight-byte little-endian length plus bytes:
+
+```text
+T = SHA256(LP(context) || LP(empty) || LP(empty) || LP(M) || LP(N) ||
+					 LP(L) || LP(R) || LP(Z) || LP(V) || LP(encoded w0))
+confirmation_keys = HKDF-SHA256(T, salt=64 zero bytes, info="ConfirmationKeys", length=64)
+shared_key        = HKDF-SHA256(T, salt=32 zero bytes, info="SharedKey", length=32)
+user_confirm      = HMAC-SHA256(confirmation_keys[0:32], encoded R)
+dev_confirm       = HMAC-SHA256(confirmation_keys[32:64], encoded L)
+```
+
+HKDF includes extract and expand, despite the reference helper's `_hkdf_expand`
+name. POST `pake_share` inside the same `login` envelope to `/`, with
+`user_share = B64(L)` and `user_confirm = B64(user_confirm)`. Verify returned
+`dev_confirm` as decoded bytes using constant-time comparison before accepting
+`sessionId` (or `stok`) and unsigned 32-bit `start_seq`.
+
+#### Protected Requests
+
+```text
+key        = HKDF-SHA256(shared_key, salt="tp-kdf-salt-aes128-key", info="tp-kdf-info-aes128-key", length=16)
+base_nonce = HKDF-SHA256(shared_key, salt="tp-kdf-salt-aes128-iv", info="tp-kdf-info-aes128-iv", length=12)
+nonce      = base_nonce[0:8] || uint32_big_endian(sequence)
+body       = uint32_big_endian(sequence) || AES-128-CCM(key, nonce, JSON UTF-8, no AAD, 16-byte tag)
+```
+
+The tag follows the ciphertext. POST binary bytes with
+`Content-Type: application/octet-stream` to `/stok=<URL-encoded sessionId>/ds`.
+Use `start_seq` first and increment for each subsequent request. Never reuse
+a sequence after an uncertain send or wrap past `UINT32_MAX`.
+
+Responses have the same sequence prefix and AEAD frame shape. C++ requires
+the response sequence to match the request and rejects truncated frames, invalid
+tags, malformed JSON/error codes, and oversized frames. A failed TPAP request
+clears the session; reconnect explicitly. Plaintext JSON errors such as session
+expiry `-2203` are preserved, not treated as encrypted success. C++ does not
+automatically replay commands, particularly state changes; upstream retry
+behavior goes beyond this initial C++ profile.
+
+TLS/DAC verification, alternate suites/ciphers, default/shared-token passcodes,
+password-authkey, and MD5-crypt/SHA256-crypt shadows remain unsupported.
+
 ## Encoding Conventions
 
 JSON is UTF-8. Examples use compact JSON; do not send Markdown fences. `||` means
 byte concatenation. Unless explicitly called hexadecimal, a hash means the raw
-digest bytes. `B64` is standard Base64, not URL-safe Base64. AES below means
+digest bytes. `B64` is standard Base64, not URL-safe Base64. Except for the explicit
+TPAP CCM profile above, AES below means
 AES-128-CBC with PKCS#7 padding to a 16-byte block boundary, including a full
 padding block when the plaintext is already block-aligned.
 

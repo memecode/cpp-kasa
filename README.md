@@ -12,16 +12,25 @@ for networking and JSON handling.
 	A modern reply updates an earlier legacy reply for the same address; a legacy
 	reply is suppressed if a modern reply was already delivered. Each backend has
 	a five-second timeout by default.
-- Protocol-specific `DiscoverLegacy()` and `DiscoverModern()` methods are also
-	available.
 - Legacy device control uses XOR-over-TCP on port 9999, with IOT commands such
 	as `get_sysinfo` and `set_relay_state`.
 - Standard SMART switch control supports the advertised HTTP AES or KLAP v1/v2
 	transport, account credentials, `get_device_info`, and `set_device_info` for
 	the `device_on` state.
+- TPAP SMART plugs support the HTTP, no-DAC, account-password PAKE-2 profile
+	with P-256 suite 1 and AES-128-CCM. It uses the existing `ConnectSmart()`,
+	`GetDeviceInfo()`, and `SetDeviceOn()` APIs and the same utility commands.
+	No additional dependency is required. This implementation follows upstream
+	python-kasa PR #1592 and has loopback interoperability tests, but has not yet
+	been verified against a physical TPAP device.
 
 Modern control currently requires plain HTTP. HTTPS, cameras, hubs, robovacs,
 child devices, and other specialized command families are not supported.
+TPAP TLS/DAC modes, alternate suites/ciphers, default/shared-token credentials,
+password-authkey transformations, and MD5-crypt/SHA256-crypt password shadows
+are not supported. Unsupported variants fail explicitly rather than falling
+back to a weaker transport. TPAP session expiry or authentication failure clears
+the connection; reconnect explicitly before another request.
 Discovery does not attempt to decrypt optional encrypted metadata. The protocol
 reference is in [docs/kasa-protocol.md](docs/kasa-protocol.md).
 
@@ -53,18 +62,17 @@ executable in the build directory.
 
 ```text
 util discover
-util discover-modern
-util get <ip|deviceName>
-util set <ip|deviceName> <on|off>
-util smart-get <ip|deviceName> <username> <password>
-util smart-set <ip|deviceName> <username> <password> <on|off>
+util get <ip|deviceName> [<username> <password>]
+util set <ip|deviceName> <on|off> [<username> <password>]
 ```
 
-`discover` runs both discovery backends. `discover-modern` runs only modern TDP
-discovery. Device replies are pretty printed as JSON. The `get` and `set`
-commands use legacy XOR control; `smart-get` and `smart-set` discover and log in
-to a standard SMART switch. SMART commands require the device's account
-username and password. Set commands use explicit on/off state.
+`discover` automatically runs both discovery backends.
+Device replies are pretty printed as JSON. The `get` and `set` commands discover
+the target and automatically select legacy XOR or SMART control. SMART devices
+require the device's account username and password as the final two arguments;
+legacy devices do not require credentials and ignore them if supplied. Credentials
+must be supplied together. Set commands use explicit on/off state. Protocol
+selection waits for discovery to finish so modern replies can supersede legacy ones.
 
 For example, after building:
 
@@ -72,8 +80,8 @@ For example, after building:
 ./build/util discover
 ./build/util get 192.168.1.50
 ./build/util set 192.168.1.50 on
-./build/util smart-get 192.168.1.51 user@example.com password
-./build/util smart-set 192.168.1.51 user@example.com password off
+./build/util get 192.168.1.51 user@example.com password
+./build/util set 192.168.1.51 off user@example.com password
 ```
 
 ## Library API
@@ -118,9 +126,9 @@ smart.ConnectSmart("192.168.1.51", "username", "password",
 ```
 
 `Discover()` uses directed broadcast addresses when no target is supplied, or
-unicasts to a supplied IP address or hostname. `Discover()`, `DiscoverLegacy()`,
-and `DiscoverModern()` take a `TDeviceCb` (`std::function<void(const LKasaDevice &)>`)
-and call it as each device arrives, with its source IP and raw JSON response.
+unicasts to a supplied IP address or hostname. It automatically probes both
+discovery protocols, takes a `TDeviceCb` (`std::function<void(const LKasaDevice &)>`),
+and calls it as each device arrives, with its source IP and raw JSON response.
 The device reference is valid only during the callback. To retain device data
 on another thread, deep-copy its strings with `LString::Set()` or `std::string`;
 ordinary `LString` copies share storage with a non-atomic reference count.
@@ -144,17 +152,23 @@ Discovery accepts an optional completion callback:
 `Discover(onDevice, targetIp, onComplete)`. Completion reports whether any devices
 replied. `Disconnect()` also queues behind earlier operations.
 
-Completion callbacks run on the instance's worker. Combined discovery invokes
-device callbacks serially on its discovery threads; protocol-specific discovery
-invokes them on the worker. Callback references are only valid during the call.
+Completion callbacks run on the instance's worker. Discovery invokes device
+callbacks serially on its discovery threads. Callback references are only valid
+during the call.
 Callbacks may enqueue more operations, but must not wait for those operations,
 destroy the instance, or throw. Dispatch UI work to the UI thread.
 `IsConnected()` and `GetError()` return synchronized snapshots of the last completed
 operation, without waiting for pending work.
 
 Keep the instance and callback captures alive until all desired callbacks have
-finished. Destruction rejects further submissions, drains accepted work, joins the
-worker, and then closes the connection; it can block until network timeouts expire.
+finished. Destruction rejects further submissions, discards queued work, cancels
+active discovery and socket I/O, joins the worker, and closes the connection.
+Cancelled work does not deliver completion callbacks. No callbacks remain running
+after destruction returns. Discovery checks cancellation at intervals of at most
+50 ms; network sockets use Lgi's cancellable waits instead of waiting for the full
+configured timeout. An already-running callback must return before destruction
+can finish. Platform DNS resolution and cryptographic work already in progress
+may also delay shutdown because they cannot be interrupted by socket cancellation.
 Destroy instances on their owning thread, not from a callback. If callbacks enqueue
 follow-up work, keep the instance alive until that chain completes: follow-up
 submissions are rejected once destruction begins. The command-line utility waits

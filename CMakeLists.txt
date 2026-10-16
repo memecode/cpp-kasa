@@ -37,9 +37,20 @@ target_link_libraries(util
         cpp-kasa)
 
 include(CTest)
+
 if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(async-tests tests/async.cpp)
-    target_link_libraries(async-tests PRIVATE cpp-kasa Threads::Threads)
+    target_link_libraries(async-tests PRIVATE cpp-kasa Threads::Threads OpenSSL::Crypto)
     add_test(NAME async-api COMMAND async-tests)
     set_tests_properties(async-api PROPERTIES TIMEOUT 30)
 endif()
+
+
+# GUI executable:
+add_executable(kasa-gui
+    src/gui.cpp
+    ${LGI_DIR}/src/common/Lgi/LgiMain.cpp)
+
+target_link_libraries(kasa-gui
+    PRIVATE
+        cpp-kasa)

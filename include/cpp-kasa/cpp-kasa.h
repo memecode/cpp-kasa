@@ -14,6 +14,7 @@
 struct LKasaDevice
 {
     LString Ip;
+    LString Name;
     LString Response; // Json
 };
 
@@ -26,6 +27,19 @@ public:
     using TStatusCb = std::function<void(bool, const LString &)>;
 
 private:
+    struct Cancellation : LCancel
+    {
+        std::atomic<bool> Cancelled{false};
+        bool IsCancelled() override { return Cancelled.load(); }
+        bool Cancel(bool cancelled = true) override
+        {
+            Cancelled.store(cancelled);
+            return true;
+        }
+    };
+
+    std::shared_ptr<Cancellation> CancelState = std::make_shared<Cancellation>();
+    bool OwnsCancellation = true;
     LSocket Socket;
     LError LastError;
     std::unique_ptr<LKasaSmartSession> Smart;
@@ -73,19 +87,16 @@ public:
     bool IsConnected() const;
     LError GetError() const;
 
+    // targetIp is an IPv4 address or hostname to probe directly.
+    // nullptr broadcasts discovery probes on all usable non-loopback IPv4 interfaces.
     bool Discover(const TDeviceCb &onDevice, const char *targetIp = nullptr,
         const TStatusCb &onComplete = {});
-    bool DiscoverLegacy(const TDeviceCb &onDevice, const char *targetIp = nullptr,
-        const TStatusCb &onComplete = {});
-    bool DiscoverModern(const TDeviceCb &onDevice, const char *targetIp = nullptr,
-        const TStatusCb &onComplete = {});
-
     // Sends an IOT JSON command and returns the decrypted response JSON.
     bool Request(const char *requestJson, const TStatusCb &onComplete);
     bool GetSysInfo(const TStatusCb &onComplete);
     bool SetRelayState(bool on, const TStatusCb &onComplete);
 
-    // Connect to a discovered standard SMART switch using its advertised AES or KLAP transport.
+    // Connect to a discovered standard SMART switch using its advertised AES, KLAP, or supported TPAP profile.
     bool ConnectSmart(const LKasaDevice &device, const char *username, const char *password,
         const TStatusCb &onComplete);
     bool ConnectSmart(const char *host, const char *username, const char *password,
