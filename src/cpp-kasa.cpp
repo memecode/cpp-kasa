@@ -115,6 +115,13 @@ bool LKasaProtocol::SetTimeout(int timeoutMs)
 	return true;
 }
 
+void LKasaProtocol::SetCredentials(const char *username, const char *password)
+{
+	std::lock_guard<std::mutex> lock(StatusMutex);
+	Username.Set(username && password ? username : nullptr);
+	Password.Set(username && password ? password : nullptr);
+}
+
 bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete)
 {
 	std::lock_guard<std::mutex> lock(QueueMutex);
@@ -361,7 +368,7 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 
 	LString probe = "{\"system\":{\"get_sysinfo\":{}}}";
 	LString encryptedProbe = XorEncrypt(probe.Get(), probe.Length());
-	int sent = 0;
+	LArray<uint32_t> targets;
 	if (targetIp)
 	{
 		uint32_t target = LHostnameToIp(targetIp);
@@ -370,7 +377,7 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 			LastError.Set(LErrorInvalidParam, "Invalid discovery target");
 			return false;
 		}
-		sent = discoverySocket.WriteUdp(encryptedProbe.Get(), (int)encryptedProbe.Length(), 0, target, DefaultPort) > 0;
+		targets.New() = target;
 	}
 	else
 	{
@@ -381,7 +388,6 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 			return false;
 		}
 
-		LArray<uint32_t> broadcastIps;
 		for (auto &interface: interfaces)
 		{
 			if (!interface.Ip4 || !interface.Netmask4 || interface.IsLoopBack())
@@ -393,36 +399,46 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 				continue;
 
 			bool duplicate = false;
-			for (auto existing: broadcastIps)
+			for (auto existing: targets)
 				if (existing == broadcastIp)
 					duplicate = true;
 			if (duplicate)
 				continue;
 
-			broadcastIps.New() = broadcastIp;
-			if (discoverySocket.WriteUdp(encryptedProbe.Get(), (int)encryptedProbe.Length(), 0,
-				broadcastIp, DefaultPort) > 0)
-				sent++;
+			targets.New() = broadcastIp;
 		}
 	}
 
-	if (!sent)
+	if (!targets.Length())
 	{
-		LastError = discoverySocket.GetError();
-		if (!LastError)
-			LastError.Set(LErrorFuncFailed, "Unable to send discovery probe");
+		LastError.Set(LErrorFuncFailed, "No usable discovery targets found");
 		return false;
 	}
 
-	const uint64_t deadline = LCurrentTime() + timeoutMs;
+	int sent = 0;
+	const uint64_t start = LCurrentTime();
+	const uint64_t deadline = start + (uint64_t)timeoutMs;
+	uint64_t nextRound = start;
+	int roundsSent = 0;
 	std::string datagram(65507, '\0');
 	while (!CancelState->IsCancelled())
 	{
 		uint64_t now = LCurrentTime();
+		while (roundsSent < 3 && now >= nextRound)
+		{
+			for (auto target: targets)
+				if (discoverySocket.WriteUdp(encryptedProbe.Get(), (int)encryptedProbe.Length(), 0,
+					target, DefaultPort) > 0)
+					sent++;
+			roundsSent++;
+			nextRound = start + ((uint64_t)timeoutMs * roundsSent) / 3;
+			now = LCurrentTime();
+		}
 		if (now >= deadline)
 			break;
 
-		int waitMs = (int)(deadline - now);
+		uint64_t wakeAt = roundsSent < 3 ? MIN(nextRound, deadline) : deadline;
+		int waitMs = (int)(wakeAt > now ? wakeAt - now : 0);
 		if (!discoverySocket.IsReadable(MIN(waitMs, 50)))
 			continue;
 
@@ -454,6 +470,13 @@ bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *ta
 			onDevice(device);
 	}
 
+	if (!sent)
+	{
+		LastError = discoverySocket.GetError();
+		if (!LastError)
+			LastError.Set(LErrorFuncFailed, "Unable to send discovery probe");
+		return false;
+	}
 	if (!discoveredIps.Length())
 	{
 		LastError.Set(LErrorTimedOut, "No legacy devices replied before the timeout");

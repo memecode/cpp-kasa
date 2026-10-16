@@ -954,6 +954,14 @@ LKasaProtocol::LKasaProtocol()
 	Worker = std::thread([this]() { WorkerLoop(); });
 }
 
+LKasaProtocol::LKasaProtocol(const LKasaProtocol &other)
+	: LKasaProtocol()
+{
+	std::lock_guard<std::mutex> lock(other.StatusMutex);
+	Username.Set(other.Username.Get());
+	Password.Set(other.Password.Get());
+}
+
 LKasaProtocol::~LKasaProtocol()
 {
 	{
@@ -983,6 +991,28 @@ void LKasaProtocol::ApplyTimeout(int timeoutMs)
 	Socket.SetTimeout(timeoutMs);
 	if (Smart)
 		Smart->TimeoutMs = timeoutMs;
+}
+
+bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const TStatusCb &onComplete)
+{
+	LString user, secret;
+	{
+		std::lock_guard<std::mutex> lock(StatusMutex);
+		user.Set(Username.Get());
+		secret.Set(Password.Get());
+	}
+	return ConnectSmart(device, user.Get(), secret.Get(), onComplete);
+}
+
+bool LKasaProtocol::ConnectSmart(const char *host, const TStatusCb &onComplete)
+{
+	LString user, secret;
+	{
+		std::lock_guard<std::mutex> lock(StatusMutex);
+		user.Set(Username.Get());
+		secret.Set(Password.Get());
+	}
+	return ConnectSmart(host, user.Get(), secret.Get(), onComplete);
 }
 
 bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const char *username,

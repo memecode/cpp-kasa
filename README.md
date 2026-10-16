@@ -112,7 +112,8 @@ kasa.Connect("192.168.1.50", [&](bool connected, const LString &message)
 
 // Use a separate instance for a separate device connection.
 LKasaProtocol smart;
-smart.ConnectSmart("192.168.1.51", "username", "password",
+smart.SetCredentials("username", "password");
+smart.ConnectSmart("192.168.1.51",
 	[&](bool connected, const LString &message)
 	{
 		if (connected)
@@ -139,6 +140,12 @@ that it succeeded. `Connect()`, `Request()`, `GetSysInfo()`, `SetRelayState()`,
 (`std::function<void(bool, const LString &)>`). It receives success and response
 JSON, or failure and an error message. Successful connections have an empty
 message. Request inputs, device metadata, and credentials are copied at submission.
+
+`SetCredentials(username, password)` stores an owned, thread-safe copy in memory.
+The `ConnectSmart(host, callback)` and `ConnectSmart(device, callback)` overloads
+use those credentials; the overloads accepting explicit credentials remain available
+and do not change the stored pair. Passing either credential as `nullptr` clears
+the stored pair. Updates do not affect queued logins or existing sessions.
 
 Each instance has a thread-safe timeout setting, initially 5000 ms
 (`DefaultTimeoutMs`). Use `GetTimeout()` to read it and `SetTimeout(milliseconds)`

@@ -51,6 +51,8 @@ private:
     mutable std::mutex StatusMutex;
     mutable LError PublishedError;
     bool Connected = false;
+    LString Username;
+    LString Password;
     std::atomic<int> Timeout{DefaultTimeoutMs};
 
     bool Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete);
@@ -77,10 +79,12 @@ public:
     static constexpr int DefaultTimeoutMs = 5000;
 
     LKasaProtocol();
+    LKasaProtocol(const LKasaProtocol &other);
     ~LKasaProtocol();
 
     int GetTimeout() const;
     bool SetTimeout(int timeoutMs);
+    void SetCredentials(const char *username, const char *password);
 
     bool Connect(const char *host, const TStatusCb &onComplete, int port = DefaultPort);
     void Disconnect();
@@ -97,6 +101,8 @@ public:
     bool SetRelayState(bool on, const TStatusCb &onComplete);
 
     // Connect to a discovered standard SMART switch using its advertised AES, KLAP, or supported TPAP profile.
+    bool ConnectSmart(const LKasaDevice &device, const TStatusCb &onComplete);
+    bool ConnectSmart(const char *host, const TStatusCb &onComplete);
     bool ConnectSmart(const LKasaDevice &device, const char *username, const char *password,
         const TStatusCb &onComplete);
     bool ConnectSmart(const char *host, const char *username, const char *password,

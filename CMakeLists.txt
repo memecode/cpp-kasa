@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(cpp-kasa)
 
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 find_package(Threads REQUIRED)
@@ -49,7 +50,8 @@ endif()
 # GUI executable:
 add_executable(kasa-gui
     src/gui.cpp
-    ${LGI_DIR}/src/common/Lgi/LgiMain.cpp)
+    ${LGI_DIR}/src/common/Lgi/LgiMain.cpp
+    ${LGI_DIR}/src/common/Text/XmlTreeUi.cpp)
 
 target_link_libraries(kasa-gui
     PRIVATE
