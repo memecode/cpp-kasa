@@ -4,6 +4,7 @@ project(cpp-kasa)
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
+find_package(Threads REQUIRED)
 
 set(LGI_LIB_ONLY TRUE)
 add_subdirectory(../lgi/trunk lgi)
@@ -24,7 +25,8 @@ target_link_libraries(cpp-kasa
         lgi
     PRIVATE
         OpenSSL::Crypto
-        OpenSSL::SSL)
+        OpenSSL::SSL
+        Threads::Threads)
 
 # utility executable:
 add_executable(util
@@ -33,3 +35,11 @@ add_executable(util
 target_link_libraries(util
     PRIVATE
         cpp-kasa)
+
+include(CTest)
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(async-tests tests/async.cpp)
+    target_link_libraries(async-tests PRIVATE cpp-kasa Threads::Threads)
+    add_test(NAME async-api COMMAND async-tests)
+    set_tests_properties(async-api PROPERTIES TIMEOUT 30)
+endif()

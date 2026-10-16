@@ -13,6 +13,7 @@
 #include "lgi/common/Json.h"
 
 #include <iostream>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -36,10 +37,24 @@ namespace
 			<< "  " << name << " smart-set <ip|deviceName> <username> <password> <on|off>\n";
 	}
 
-	void PrintError(const LKasaProtocol &protocol)
+	template<typename Submit>
+	bool WaitForStatus(Submit submit, LString &response)
 	{
-		LError error = protocol.GetLastError();
-		std::cerr << error.ToString().Get() << '\n';
+		auto complete = std::make_shared<std::promise<bool>>();
+		auto result = complete->get_future();
+		if (!submit([&response, complete](bool success, const LString &message)
+		{
+			response.Set(message.Get(), message.Length());
+			complete->set_value(success);
+		}))
+		{
+			std::cerr << "Unable to queue operation\n";
+			return false;
+		}
+		bool success = result.get();
+		if (!success)
+			std::cerr << response.Get() << '\n';
+		return success;
 	}
 }
 
@@ -53,31 +68,25 @@ int main(int argc, char **argv)
 
 	LKasaProtocol protocol;
 	const char *command = argv[1];
+	auto printDevice = [](const LKasaDevice &device)
+	{
+		std::cout << device.Ip.Get() << '\n' << PrettyJson(device.Response).Get() << "\n\n" << std::flush;
+	};
 	if (strcmp(command, "discover") == 0 && argc == 2)
 	{
-		LArray<LKasaDevice> devices;
-		if (!protocol.Discover(devices))
+		LString response;
+		return WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
 		{
-			PrintError(protocol);
-			return 1;
-		}
-
-		for (auto &device: devices)
-			std::cout << device.Ip.Get() << '\n' << PrettyJson(device.Response).Get() << "\n\n";
-		return 0;
+			return protocol.Discover(printDevice, nullptr, complete);
+		}, response) ? 0 : 1;
 	}
 	if (strcmp(command, "discover-modern") == 0 && argc == 2)
 	{
-		LArray<LKasaDevice> devices;
-		if (!protocol.DiscoverModern(devices))
+		LString response;
+		return WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
 		{
-			PrintError(protocol);
-			return 1;
-		}
-
-		for (auto &device: devices)
-			std::cout << device.Ip.Get() << '\n' << PrettyJson(device.Response).Get() << "\n\n";
-		return 0;
+			return protocol.DiscoverModern(printDevice, nullptr, complete);
+		}, response) ? 0 : 1;
 	}
 	if ((strcmp(command, "smart-get") == 0 && argc == 5) ||
 		(strcmp(command, "smart-set") == 0 && argc == 6))
@@ -94,18 +103,18 @@ int main(int argc, char **argv)
 				return 2;
 			}
 		}
-		if (!protocol.ConnectSmart(argv[2], argv[3], argv[4]))
-		{
-			PrintError(protocol);
-			return 1;
-		}
 		LString response;
-		bool success = isSet
-			? protocol.SetDeviceOn(on, response)
-			: protocol.GetDeviceInfo(response);
+		if (!WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
+		{
+			return protocol.ConnectSmart(argv[2], argv[3], argv[4], complete);
+		}, response))
+			return 1;
+		bool success = WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
+		{
+			return isSet ? protocol.SetDeviceOn(on, complete) : protocol.GetDeviceInfo(complete);
+		}, response);
 		if (!success)
 		{
-			PrintError(protocol);
 			return 1;
 		}
 		std::cout << PrettyJson(response).Get() << '\n';
@@ -128,19 +137,18 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (!protocol.Connect(argv[2]))
-		{
-			PrintError(protocol);
-			return 1;
-		}
-
 		LString response;
-		bool success = isSet
-			? protocol.SetRelayState(on, response)
-			: protocol.GetSysInfo(response);
+		if (!WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
+		{
+			return protocol.Connect(argv[2], complete);
+		}, response))
+			return 1;
+		bool success = WaitForStatus([&](const LKasaProtocol::TStatusCb &complete)
+		{
+			return isSet ? protocol.SetRelayState(on, complete) : protocol.GetSysInfo(complete);
+		}, response);
 		if (!success)
 		{
-			PrintError(protocol);
 			return 1;
 		}
 

@@ -568,11 +568,18 @@ namespace
 
 LKasaProtocol::LKasaProtocol()
 {
+	Worker = std::thread([this]() { WorkerLoop(); });
 }
 
 LKasaProtocol::~LKasaProtocol()
 {
-	Disconnect();
+	{
+		std::lock_guard<std::mutex> lock(QueueMutex);
+		Stopping = true;
+	}
+	QueueReady.notify_one();
+	Worker.join();
+	DisconnectSync();
 }
 
 void LKasaProtocol::ClearSmartSession()
@@ -585,10 +592,53 @@ bool LKasaProtocol::HasSmartSession() const
 	return Smart != nullptr;
 }
 
+void LKasaProtocol::ApplyTimeout(int timeoutMs)
+{
+	Socket.SetTimeout(timeoutMs);
+	if (Smart)
+		Smart->TimeoutMs = timeoutMs;
+}
+
 bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const char *username,
+	const char *password, const TStatusCb &onComplete)
+{
+	if (!onComplete)
+		return false;
+	std::string ip = device.Ip.Get() ? device.Ip.Get() : "";
+	std::string metadata = device.Response.Get() ? device.Response.Get() : "";
+	std::string user = username ? username : "";
+	std::string secret = password ? password : "";
+	bool credentials = username && password;
+	return Enqueue([=](LString &, int timeoutMs)
+	{
+		LKasaDevice copy;
+		copy.Ip = ip.c_str();
+		copy.Response = metadata.c_str();
+		return ConnectSmartSync(copy, credentials ? user.c_str() : nullptr,
+			credentials ? secret.c_str() : nullptr, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::ConnectSmart(const char *host, const char *username,
+	const char *password, const TStatusCb &onComplete)
+{
+	if (!onComplete)
+		return false;
+	std::string address = host ? host : "";
+	std::string user = username ? username : "";
+	std::string secret = password ? password : "";
+	bool credentials = username && password;
+	return Enqueue([=](LString &, int timeoutMs)
+	{
+		return ConnectSmartSync(address.c_str(), credentials ? user.c_str() : nullptr,
+			credentials ? secret.c_str() : nullptr, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::ConnectSmartSync(const LKasaDevice &device, const char *username,
 	const char *password, int timeoutMs)
 {
-	Disconnect();
+	DisconnectSync();
 	LastError.Empty();
 	if (!username || !password || timeoutMs <= 0 || !device.Ip || !device.Response)
 	{
@@ -663,7 +713,7 @@ bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const char *username
 	return true;
 }
 
-bool LKasaProtocol::ConnectSmart(const char *host, const char *username,
+bool LKasaProtocol::ConnectSmartSync(const char *host, const char *username,
 	const char *password, int timeoutMs)
 {
 	if (!host || !*host)
@@ -672,9 +722,12 @@ bool LKasaProtocol::ConnectSmart(const char *host, const char *username,
 		return false;
 	}
 	LArray<LKasaDevice> devices;
-	if (!DiscoverModern(devices, host, timeoutMs) || !devices.Length())
+	if (!DiscoverModernSync([&](const LKasaDevice &device)
+		{
+			devices.New() = device;
+		}, host, timeoutMs) || !devices.Length())
 		return false;
-	return ConnectSmart(devices[0], username, password, timeoutMs);
+	return ConnectSmartSync(devices[0], username, password, timeoutMs);
 }
 
 bool LKasaProtocol::SmartRequest(const char *method, const char *paramsJson, LString &responseJson)
@@ -751,14 +804,22 @@ bool LKasaProtocol::SmartRequest(const char *method, const char *paramsJson, LSt
 	return true;
 }
 
-bool LKasaProtocol::GetDeviceInfo(LString &responseJson)
+bool LKasaProtocol::GetDeviceInfo(const TStatusCb &onComplete)
 {
-	return SmartRequest("get_device_info", nullptr, responseJson);
+	if (!onComplete)
+		return false;
+	return Enqueue([this](LString &response, int)
+	{
+		return SmartRequest("get_device_info", nullptr, response);
+	}, onComplete);
 }
 
-bool LKasaProtocol::SetDeviceOn(bool on, LString &responseJson)
+bool LKasaProtocol::SetDeviceOn(bool on, const TStatusCb &onComplete)
 {
-	return on
-		? SmartRequest("set_device_info", "{\"device_on\":true}", responseJson)
-		: SmartRequest("set_device_info", "{\"device_on\":false}", responseJson);
+	if (!onComplete)
+		return false;
+	return Enqueue([this, on](LString &response, int)
+	{
+		return SmartRequest("set_device_info", on ? "{\"device_on\":true}" : "{\"device_on\":false}", response);
+	}, onComplete);
 }

@@ -1,7 +1,9 @@
 #include "cpp-kasa/cpp-kasa.h"
 #include "lgi/common/Json.h"
 
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -14,6 +16,16 @@ namespace
 {
 	constexpr uint32_t MaxFrameSize = (uint32_t)LKasaProtocol::MaxMessageSize;
 	constexpr uint16_t ModernDiscoveryPorts[] = { 20002, 20004 };
+
+	LError CopyError(LError &source)
+	{
+		LError copy(source.GetCode(), source.GetMsg().Get());
+		copy.SrcFile = source.SrcFile;
+		copy.SrcLine = source.SrcLine;
+		for (auto &note: source.DevNotes)
+			copy.DevNotes.New().Set(note.Get(), note.Length());
+		return copy;
+	}
 
 	uint32_t Crc32(const char *data, size_t size)
 	{
@@ -90,12 +102,99 @@ namespace
 	}
 }
 
-bool LKasaProtocol::Connect(const char *host, int port, int timeoutMs)
+int LKasaProtocol::GetTimeout() const
 {
-	Disconnect();
+	return Timeout.load();
+}
+
+bool LKasaProtocol::SetTimeout(int timeoutMs)
+{
+	if (timeoutMs <= 0)
+		return false;
+	Timeout.store(timeoutMs);
+	return true;
+}
+
+bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete)
+{
+	std::lock_guard<std::mutex> lock(QueueMutex);
+	if (Stopping)
+		return false;
+	int timeoutMs = GetTimeout();
+	Pending.emplace_back([this, operation = std::move(operation), onComplete, timeoutMs]()
+	{
+		LString response;
+		bool success = false;
+		LastError.Empty();
+		try
+		{
+			ApplyTimeout(timeoutMs);
+			success = operation(response, timeoutMs);
+		}
+		catch (const std::exception &error)
+		{
+			LastError.Set(LErrorFuncFailed, error.what());
+		}
+		catch (...)
+		{
+			LastError.Set(LErrorFuncFailed, "Asynchronous operation threw an exception");
+		}
+		if (!success)
+			response = LastError.ToString();
+		{
+			std::lock_guard<std::mutex> statusLock(StatusMutex);
+			PublishedError = CopyError(LastError);
+			Connected = Socket.IsOpen() || HasSmartSession();
+		}
+		if (onComplete)
+			onComplete(success, response);
+	});
+	QueueReady.notify_one();
+	return true;
+}
+
+void LKasaProtocol::WorkerLoop()
+{
+	while (true)
+	{
+		std::function<void()> operation;
+		{
+			std::unique_lock<std::mutex> lock(QueueMutex);
+			QueueReady.wait(lock, [this]() { return Stopping || !Pending.empty(); });
+			if (Pending.empty())
+				return;
+			operation = std::move(Pending.front());
+			Pending.pop_front();
+		}
+		try
+		{
+			operation();
+		}
+		catch (...)
+		{
+			std::lock_guard<std::mutex> lock(StatusMutex);
+			PublishedError.Set(LErrorFuncFailed, "Completion callback threw an exception");
+		}
+	}
+}
+
+bool LKasaProtocol::Connect(const char *host, const TStatusCb &onComplete, int port)
+{
+	if (!onComplete)
+		return false;
+	std::string hostCopy = host ? host : "";
+	return Enqueue([=](LString &, int timeoutMs)
+	{
+		return ConnectSync(hostCopy.c_str(), port, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::ConnectSync(const char *host, int port, int timeoutMs)
+{
+	DisconnectSync();
 	LastError.Empty();
 
-	if (!host || !*host || port <= 0 || port > 65535)
+	if (!host || !*host || port <= 0 || port > 65535 || timeoutMs <= 0)
 	{
 		LastError.Set(LErrorInvalidParam, "Invalid host or port");
 		return false;
@@ -114,6 +213,15 @@ bool LKasaProtocol::Connect(const char *host, int port, int timeoutMs)
 
 void LKasaProtocol::Disconnect()
 {
+	Enqueue([this](LString &, int)
+	{
+		DisconnectSync();
+		return true;
+	}, {});
+}
+
+void LKasaProtocol::DisconnectSync()
+{
 	if (Socket.IsOpen())
 		Socket.Close();
 	ClearSmartSession();
@@ -121,67 +229,124 @@ void LKasaProtocol::Disconnect()
 
 bool LKasaProtocol::IsConnected() const
 {
-	return const_cast<LSocket &>(Socket).IsOpen() || HasSmartSession();
+	std::lock_guard<std::mutex> lock(StatusMutex);
+	return Connected;
 }
 
-LError LKasaProtocol::GetLastError() const
+LError LKasaProtocol::GetError() const
 {
-	return LastError;
+	std::lock_guard<std::mutex> lock(StatusMutex);
+	return CopyError(PublishedError);
 }
 
-bool LKasaProtocol::Discover(LArray<LKasaDevice> &devices, const char *targetIp, int timeoutMs)
+bool LKasaProtocol::Discover(const TDeviceCb &onDevice, const char *targetIp,
+	const TStatusCb &onComplete)
 {
-	devices.Length(0);
-	LastError.Empty();
-	if (timeoutMs <= 0)
+	if (!onDevice)
+		return false;
+	std::string target = targetIp ? targetIp : "";
+	bool directed = targetIp != nullptr;
+	return Enqueue([=](LString &, int timeoutMs)
 	{
-		LastError.Set(LErrorInvalidParam, "Discovery timeout must be positive");
+		return DiscoverSync(onDevice, directed ? target.c_str() : nullptr, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::DiscoverLegacy(const TDeviceCb &onDevice, const char *targetIp,
+	const TStatusCb &onComplete)
+{
+	if (!onDevice)
+		return false;
+	std::string target = targetIp ? targetIp : "";
+	bool directed = targetIp != nullptr;
+	return Enqueue([=](LString &, int timeoutMs)
+	{
+		return DiscoverLegacySync(onDevice, directed ? target.c_str() : nullptr, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::DiscoverModern(const TDeviceCb &onDevice, const char *targetIp,
+	const TStatusCb &onComplete)
+{
+	if (!onDevice)
+		return false;
+	std::string target = targetIp ? targetIp : "";
+	bool directed = targetIp != nullptr;
+	return Enqueue([=](LString &, int timeoutMs)
+	{
+		return DiscoverModernSync(onDevice, directed ? target.c_str() : nullptr, timeoutMs);
+	}, onComplete);
+}
+
+bool LKasaProtocol::DiscoverSync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs)
+{
+	LastError.Empty();
+	if (!onDevice || timeoutMs <= 0)
+	{
+		LastError.Set(LErrorInvalidParam, "Discovery requires a callback and a positive timeout");
 		return false;
 	}
 
-	LArray<LKasaDevice> legacyDevices;
-	LArray<LKasaDevice> modernDevices;
+	std::mutex callbackMutex;
+	LArray<LString> modernIps;
+	bool foundDevice = false;
+	auto deliver = [&](const LKasaDevice &device, bool modern)
+	{
+		std::lock_guard<std::mutex> lock(callbackMutex);
+		for (auto &ip: modernIps)
+			if (ip == device.Ip)
+				return;
+		if (modern)
+			modernIps.New() = device.Ip;
+		foundDevice = true;
+		onDevice(device);
+	};
 	LKasaProtocol legacyProtocol;
 	LKasaProtocol modernProtocol;
 	bool foundLegacy = false;
 	bool foundModern = false;
 	LError legacyError;
 	LError modernError;
+	std::exception_ptr legacyException;
+	std::exception_ptr modernException;
 	std::thread legacyThread([&]()
 	{
-		foundLegacy = legacyProtocol.DiscoverLegacy(legacyDevices, targetIp, timeoutMs);
-		legacyError = legacyProtocol.GetLastError();
+		try
+		{
+			foundLegacy = legacyProtocol.DiscoverLegacySync([&](const LKasaDevice &device)
+			{
+				deliver(device, false);
+			}, targetIp, timeoutMs);
+			legacyError = legacyProtocol.LastError;
+		}
+		catch (...)
+		{
+			legacyException = std::current_exception();
+		}
 	});
 	std::thread modernThread([&]()
 	{
-		foundModern = modernProtocol.DiscoverModern(modernDevices, targetIp, timeoutMs);
-		modernError = modernProtocol.GetLastError();
+		try
+		{
+			foundModern = modernProtocol.DiscoverModernSync([&](const LKasaDevice &device)
+			{
+				deliver(device, true);
+			}, targetIp, timeoutMs);
+			modernError = modernProtocol.LastError;
+		}
+		catch (...)
+		{
+			modernException = std::current_exception();
+		}
 	});
 	legacyThread.join();
 	modernThread.join();
+	if (legacyException)
+		std::rethrow_exception(legacyException);
+	if (modernException)
+		std::rethrow_exception(modernException);
 
-	for (auto &device: legacyDevices)
-		devices.New() = device;
-
-	for (auto &modernDevice: modernDevices)
-	{
-		LKasaDevice *existing = nullptr;
-		for (auto &device: devices)
-		{
-			if (device.Ip == modernDevice.Ip)
-			{
-				existing = &device;
-				break;
-			}
-		}
-
-		if (existing)
-			existing->Response = modernDevice.Response;
-		else
-			devices.New() = modernDevice;
-	}
-
-	if (devices.Length())
+	if (foundDevice)
 	{
 		LastError.Empty();
 		return true;
@@ -196,15 +361,15 @@ bool LKasaProtocol::Discover(LArray<LKasaDevice> &devices, const char *targetIp,
 	return false;
 }
 
-bool LKasaProtocol::DiscoverLegacy(LArray<LKasaDevice> &devices, const char *targetIp, int timeoutMs)
+bool LKasaProtocol::DiscoverLegacySync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs)
 {
-	devices.Length(0);
 	LastError.Empty();
-	if (timeoutMs <= 0)
+	if (!onDevice || timeoutMs <= 0)
 	{
-		LastError.Set(LErrorInvalidParam, "Discovery timeout must be positive");
+		LastError.Set(LErrorInvalidParam, "Discovery requires a callback and a positive timeout");
 		return false;
 	}
+	LArray<LString> discoveredIps;
 
 	LSocket discoverySocket;
 	discoverySocket.SetBroadcast(true);
@@ -291,18 +456,20 @@ bool LKasaProtocol::DiscoverLegacy(LArray<LKasaDevice> &devices, const char *tar
 
 		LString ip = LIpToStr(sourceIp);
 		bool duplicate = false;
-		for (auto &device: devices)
-			if (device.Ip == ip)
+		for (auto &existing: discoveredIps)
+			if (existing == ip)
 				duplicate = true;
 		if (duplicate)
 			continue;
 
-		auto &device = devices.New();
+		discoveredIps.New() = ip;
+		LKasaDevice device;
 		device.Ip = ip;
 		device.Response = plaintext;
+		onDevice(device);
 	}
 
-	if (!devices.Length())
+	if (!discoveredIps.Length())
 	{
 		LastError.Set(LErrorTimedOut, "No legacy devices replied before the timeout");
 		return false;
@@ -310,15 +477,15 @@ bool LKasaProtocol::DiscoverLegacy(LArray<LKasaDevice> &devices, const char *tar
 	return true;
 }
 
-bool LKasaProtocol::DiscoverModern(LArray<LKasaDevice> &devices, const char *targetIp, int timeoutMs)
+bool LKasaProtocol::DiscoverModernSync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs)
 {
-	devices.Length(0);
 	LastError.Empty();
-	if (timeoutMs <= 0)
+	if (!onDevice || timeoutMs <= 0)
 	{
-		LastError.Set(LErrorInvalidParam, "Discovery timeout must be positive");
+		LastError.Set(LErrorInvalidParam, "Discovery requires a callback and a positive timeout");
 		return false;
 	}
+	LArray<LString> discoveredIps;
 
 	std::string probe;
 	if (!GenerateModernProbe(probe))
@@ -415,15 +582,17 @@ bool LKasaProtocol::DiscoverModern(LArray<LKasaDevice> &devices, const char *tar
 
 		LString ip = LIpToStr(sourceIp);
 		bool duplicate = false;
-		for (auto &device: devices)
-			if (device.Ip == ip)
+		for (auto &existing: discoveredIps)
+			if (existing == ip)
 				duplicate = true;
 		if (duplicate)
 			continue;
 
-		auto &device = devices.New();
+		discoveredIps.New() = ip;
+		LKasaDevice device;
 		device.Ip = ip;
 		device.Response = responseJson;
+		onDevice(device);
 	}
 
 	if (!sent)
@@ -433,7 +602,7 @@ bool LKasaProtocol::DiscoverModern(LArray<LKasaDevice> &devices, const char *tar
 			LastError.Set(LErrorFuncFailed, "Unable to send modern discovery probes");
 		return false;
 	}
-	if (!devices.Length())
+	if (!discoveredIps.Length())
 	{
 		LastError.Set(LErrorTimedOut, "No modern devices replied before the timeout");
 		return false;
@@ -510,7 +679,19 @@ LString LKasaProtocol::XorDecrypt(const void *data, size_t size)
 	return TransformXor(data, size, true);
 }
 
-bool LKasaProtocol::Request(const char *requestJson, LString &responseJson)
+bool LKasaProtocol::Request(const char *requestJson, const TStatusCb &onComplete)
+{
+	if (!onComplete)
+		return false;
+	std::string request = requestJson ? requestJson : "";
+	bool valid = requestJson != nullptr;
+	return Enqueue([=](LString &response, int)
+	{
+		return RequestSync(valid ? request.c_str() : nullptr, response);
+	}, onComplete);
+}
+
+bool LKasaProtocol::RequestSync(const char *requestJson, LString &responseJson)
 {
 	responseJson.Empty();
 	LastError.Empty();
@@ -552,13 +733,13 @@ bool LKasaProtocol::Request(const char *requestJson, LString &responseJson)
 	if (!WriteAll(header, sizeof(header)) ||
 		!WriteAll(encrypted.Get(), (size_t)encrypted.Length()))
 	{
-		Disconnect();
+		DisconnectSync();
 		return false;
 	}
 
 	if (!ReadAll(header, sizeof(header)))
 	{
-		Disconnect();
+		DisconnectSync();
 		return false;
 	}
 	frameSize = ((uint32_t)header[0] << 24) |
@@ -568,14 +749,14 @@ bool LKasaProtocol::Request(const char *requestJson, LString &responseJson)
 	if (!frameSize || frameSize > MaxFrameSize)
 	{
 		LastError.Set(LErrorFuncFailed, "Response frame size is outside the supported range");
-		Disconnect();
+		DisconnectSync();
 		return false;
 	}
 
 	std::string encryptedResponse(frameSize, '\0');
 	if (!ReadAll(encryptedResponse.data(), encryptedResponse.size()))
 	{
-		Disconnect();
+		DisconnectSync();
 		return false;
 	}
 
@@ -586,20 +767,20 @@ bool LKasaProtocol::Request(const char *requestJson, LString &responseJson)
 	{
 		LastError.Set(LErrorFuncFailed, "Device returned invalid JSON");
 		responseJson.Empty();
-		Disconnect();
+		DisconnectSync();
 		return false;
 	}
 	return true;
 }
 
-bool LKasaProtocol::GetSysInfo(LString &responseJson)
+bool LKasaProtocol::GetSysInfo(const TStatusCb &onComplete)
 {
-	return Request("{\"system\":{\"get_sysinfo\":{}}}", responseJson);
+	return Request("{\"system\":{\"get_sysinfo\":{}}}", onComplete);
 }
 
-bool LKasaProtocol::SetRelayState(bool on, LString &responseJson)
+bool LKasaProtocol::SetRelayState(bool on, const TStatusCb &onComplete)
 {
 	return on
-		? Request("{\"system\":{\"set_relay_state\":{\"state\":1}}}", responseJson)
-		: Request("{\"system\":{\"set_relay_state\":{\"state\":0}}}", responseJson);
+		? Request("{\"system\":{\"set_relay_state\":{\"state\":1}}}", onComplete)
+		: Request("{\"system\":{\"set_relay_state\":{\"state\":0}}}", onComplete);
 }

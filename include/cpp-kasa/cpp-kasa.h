@@ -3,7 +3,13 @@
 #include "lgi/common/Lgi.h"
 #include "lgi/common/Net.h"
 
+#include <functional>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 struct LKasaDevice
 {
@@ -15,9 +21,35 @@ struct LKasaSmartSession;
 
 class LKasaProtocol
 {
+public:
+    using TDeviceCb = std::function<void(const LKasaDevice &)>;
+    using TStatusCb = std::function<void(bool, const LString &)>;
+
+private:
     LSocket Socket;
     LError LastError;
     std::unique_ptr<LKasaSmartSession> Smart;
+    std::mutex QueueMutex;
+    std::condition_variable QueueReady;
+    std::deque<std::function<void()>> Pending;
+    bool Stopping = false;
+    std::thread Worker;
+    mutable std::mutex StatusMutex;
+    mutable LError PublishedError;
+    bool Connected = false;
+    std::atomic<int> Timeout{DefaultTimeoutMs};
+
+    bool Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete);
+    void ApplyTimeout(int timeoutMs);
+    void WorkerLoop();
+    bool ConnectSync(const char *host, int port, int timeoutMs);
+    void DisconnectSync();
+    bool DiscoverSync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs);
+    bool DiscoverLegacySync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs);
+    bool DiscoverModernSync(const TDeviceCb &onDevice, const char *targetIp, int timeoutMs);
+    bool RequestSync(const char *requestJson, LString &responseJson);
+    bool ConnectSmartSync(const LKasaDevice &device, const char *username, const char *password, int timeoutMs);
+    bool ConnectSmartSync(const char *host, const char *username, const char *password, int timeoutMs);
 
     bool WriteAll(const void *data, size_t size);
     bool ReadAll(void *data, size_t size);
@@ -28,33 +60,38 @@ class LKasaProtocol
 public:
     static constexpr int DefaultPort = 9999;
     static constexpr size_t MaxMessageSize = 1024 * 1024;
+    static constexpr int DefaultTimeoutMs = 5000;
 
     LKasaProtocol();
     ~LKasaProtocol();
 
-    bool Connect(const char *host, int port = DefaultPort, int timeoutMs = 5000);
+    int GetTimeout() const;
+    bool SetTimeout(int timeoutMs);
+
+    bool Connect(const char *host, const TStatusCb &onComplete, int port = DefaultPort);
     void Disconnect();
     bool IsConnected() const;
-    LError GetLastError() const;
+    LError GetError() const;
 
-    // Probes both legacy and modern discovery backends; each gets its own timeout.
-    bool Discover(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
-    // Protocol-specific discovery for callers that only need legacy XOR devices.
-    bool DiscoverLegacy(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
-    bool DiscoverModern(LArray<LKasaDevice> &devices, const char *targetIp = nullptr, int timeoutMs = 5000);
+    bool Discover(const TDeviceCb &onDevice, const char *targetIp = nullptr,
+        const TStatusCb &onComplete = {});
+    bool DiscoverLegacy(const TDeviceCb &onDevice, const char *targetIp = nullptr,
+        const TStatusCb &onComplete = {});
+    bool DiscoverModern(const TDeviceCb &onDevice, const char *targetIp = nullptr,
+        const TStatusCb &onComplete = {});
 
     // Sends an IOT JSON command and returns the decrypted response JSON.
-    bool Request(const char *requestJson, LString &responseJson);
-    bool GetSysInfo(LString &responseJson);
-    bool SetRelayState(bool on, LString &responseJson);
+    bool Request(const char *requestJson, const TStatusCb &onComplete);
+    bool GetSysInfo(const TStatusCb &onComplete);
+    bool SetRelayState(bool on, const TStatusCb &onComplete);
 
     // Connect to a discovered standard SMART switch using its advertised AES or KLAP transport.
     bool ConnectSmart(const LKasaDevice &device, const char *username, const char *password,
-        int timeoutMs = 5000);
+        const TStatusCb &onComplete);
     bool ConnectSmart(const char *host, const char *username, const char *password,
-        int timeoutMs = 5000);
-    bool GetDeviceInfo(LString &responseJson);
-    bool SetDeviceOn(bool on, LString &responseJson);
+        const TStatusCb &onComplete);
+    bool GetDeviceInfo(const TStatusCb &onComplete);
+    bool SetDeviceOn(bool on, const TStatusCb &onComplete);
 
     // Each message starts with state 0xAB; decryption advances on ciphertext.
     static LString XorEncrypt(const void *data, size_t size);

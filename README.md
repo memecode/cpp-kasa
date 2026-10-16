@@ -8,8 +8,10 @@ for networking and JSON handling.
 
 - Combined discovery probes both legacy XOR discovery (UDP port 9999) and modern
 	TDP discovery (UDP ports 20002 and 20004) concurrently. Results are deduplicated
-	by source IP, preferring the modern response when both backends find the same
-	address. Each backend has a five-second timeout.
+	within each backend by source IP and delivered through callbacks immediately.
+	A modern reply updates an earlier legacy reply for the same address; a legacy
+	reply is suppressed if a modern reply was already delivered. Each backend has
+	a five-second timeout by default.
 - Protocol-specific `DiscoverLegacy()` and `DiscoverModern()` methods are also
 	available.
 - Legacy device control uses XOR-over-TCP on port 9999, with IOT commands such
@@ -81,27 +83,79 @@ Include `cpp-kasa/cpp-kasa.h` and use `LKasaProtocol`:
 ```cpp
 #include <cstdio>
 LKasaProtocol kasa;
-LArray<LKasaDevice> devices;
 
-if (kasa.Discover(devices))
+kasa.Discover([](const LKasaDevice &device)
 {
-    for (auto &device : devices)
-        printf("%s: %s\n", device.Ip.Get(), device.Response.Get());
-}
+	printf("%s: %s\n", device.Ip.Get(), device.Response.Get());
+});
 
-LString response;
-if (kasa.Connect("192.168.1.50") && kasa.GetSysInfo(response))
-    printf("%s\n", response.Get());
+kasa.Connect("192.168.1.50", [&](bool connected, const LString &message)
+{
+	if (!connected)
+	{
+		printf("%s\n", message.Get());
+		return;
+	}
+	kasa.GetSysInfo([](bool success, const LString &response)
+	{
+		printf("%s: %s\n", success ? "response" : "error", response.Get());
+	});
+});
 
-if (kasa.DiscoverModern(devices) && devices.Length() &&
-	kasa.ConnectSmart(devices[0], "username", "password") &&
-	kasa.GetDeviceInfo(response))
-	printf("%s\n", response.Get());
+// Use a separate instance for a separate device connection.
+LKasaProtocol smart;
+smart.ConnectSmart("192.168.1.51", "username", "password",
+	[&](bool connected, const LString &message)
+	{
+		if (connected)
+			smart.GetDeviceInfo([](bool success, const LString &response)
+			{
+				printf("%s: %s\n", success ? "response" : "error", response.Get());
+			});
+		else
+			printf("%s\n", message.Get());
+	});
 ```
 
 `Discover()` uses directed broadcast addresses when no target is supplied, or
-unicasts to a supplied IP address or hostname. Discovery returns each source IP
-and the device's raw JSON response. Control methods return `false` on failure;
-use `GetLastError()` for the associated Lgi error code and message. SMART
-switch commands use `ConnectSmart()` followed by `GetDeviceInfo()` or
-`SetDeviceOn()`.
+unicasts to a supplied IP address or hostname. `Discover()`, `DiscoverLegacy()`,
+and `DiscoverModern()` take a `TDeviceCb` (`std::function<void(const LKasaDevice &)>`)
+and call it as each device arrives, with its source IP and raw JSON response.
+The device reference is valid only during the callback. To retain device data
+on another thread, deep-copy its strings with `LString::Set()` or `std::string`;
+ordinary `LString` copies share storage with a non-atomic reference count.
+All network methods return immediately after queueing work on a per-instance
+FIFO worker. Their boolean return value means the operation was accepted, not
+that it succeeded. `Connect()`, `Request()`, `GetSysInfo()`, `SetRelayState()`,
+`ConnectSmart()`, `GetDeviceInfo()`, and `SetDeviceOn()` require a `TStatusCb`
+(`std::function<void(bool, const LString &)>`). It receives success and response
+JSON, or failure and an error message. Successful connections have an empty
+message. Request inputs, device metadata, and credentials are copied at submission.
+
+Each instance has a thread-safe timeout setting, initially 5000 ms
+(`DefaultTimeoutMs`). Use `GetTimeout()` to read it and `SetTimeout(milliseconds)`
+to change it. The setter returns `false` for nonpositive values without changing
+the setting. All discovery, connection, and request operations use this setting,
+including requests on existing connections. Each operation snapshots the timeout
+when submitted; later changes do not affect queued or running operations. Timeout
+counting starts when work executes, not while waiting in the queue.
+
+Discovery accepts an optional completion callback:
+`Discover(onDevice, targetIp, onComplete)`. Completion reports whether any devices
+replied. `Disconnect()` also queues behind earlier operations.
+
+Completion callbacks run on the instance's worker. Combined discovery invokes
+device callbacks serially on its discovery threads; protocol-specific discovery
+invokes them on the worker. Callback references are only valid during the call.
+Callbacks may enqueue more operations, but must not wait for those operations,
+destroy the instance, or throw. Dispatch UI work to the UI thread.
+`IsConnected()` and `GetError()` return synchronized snapshots of the last completed
+operation, without waiting for pending work.
+
+Keep the instance and callback captures alive until all desired callbacks have
+finished. Destruction rejects further submissions, drains accepted work, joins the
+worker, and then closes the connection; it can block until network timeouts expire.
+Destroy instances on their owning thread, not from a callback. If callbacks enqueue
+follow-up work, keep the instance alive until that chain completes: follow-up
+submissions are rejected once destruction begins. The command-line utility waits
+for completion explicitly.
