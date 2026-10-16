@@ -16,6 +16,7 @@ struct LKasaDevice
     LString Ip;
     LString Name;
     LString Response; // Json
+    bool isSmart = false;
 };
 
 struct LKasaSmartSession;
@@ -24,7 +25,7 @@ class LKasaProtocol
 {
 public:
     using TDeviceCb = std::function<void(const LKasaDevice &)>;
-    using TStatusCb = std::function<void(bool, const LString &)>;
+    using TStatusCb = std::function<void(bool, LString)>;
 
 private:
     struct Cancellation : LCancel
@@ -55,7 +56,7 @@ private:
     LString Password;
     std::atomic<int> Timeout{DefaultTimeoutMs};
 
-    bool Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete);
+    bool Enqueue(std::function<bool(LString &, int)> operation, TStatusCb onComplete);
     void ApplyTimeout(int timeoutMs);
     void WorkerLoop();
     bool ConnectSync(const char *host, int port, int timeoutMs);
@@ -86,7 +87,7 @@ public:
     bool SetTimeout(int timeoutMs);
     void SetCredentials(const char *username, const char *password);
 
-    bool Connect(const char *host, const TStatusCb &onComplete, int port = DefaultPort);
+    bool Connect(const char *host, TStatusCb onComplete, int port = DefaultPort);
     void Disconnect();
     bool IsConnected() const;
     LError GetError() const;
@@ -94,21 +95,21 @@ public:
     // targetIp is an IPv4 address or hostname to probe directly.
     // nullptr broadcasts discovery probes on all usable non-loopback IPv4 interfaces.
     bool Discover(const TDeviceCb &onDevice, const char *targetIp = nullptr,
-        const TStatusCb &onComplete = {});
+        TStatusCb onComplete = nullptr);
     // Sends an IOT JSON command and returns the decrypted response JSON.
-    bool Request(const char *requestJson, const TStatusCb &onComplete);
-    bool GetSysInfo(const TStatusCb &onComplete);
-    bool SetRelayState(bool on, const TStatusCb &onComplete);
+    bool Request(const char *requestJson, TStatusCb onComplete);
+    bool GetSysInfo(TStatusCb onComplete);
+    bool SetRelayState(bool on, TStatusCb onComplete);
 
     // Connect to a discovered standard SMART switch using its advertised AES, KLAP, or supported TPAP profile.
-    bool ConnectSmart(const LKasaDevice &device, const TStatusCb &onComplete);
-    bool ConnectSmart(const char *host, const TStatusCb &onComplete);
+    bool ConnectSmart(const LKasaDevice &device, TStatusCb onComplete);
+    bool ConnectSmart(const char *host, TStatusCb onComplete);
     bool ConnectSmart(const LKasaDevice &device, const char *username, const char *password,
-        const TStatusCb &onComplete);
+        TStatusCb onComplete);
     bool ConnectSmart(const char *host, const char *username, const char *password,
-        const TStatusCb &onComplete);
-    bool GetDeviceInfo(const TStatusCb &onComplete);
-    bool SetDeviceOn(bool on, const TStatusCb &onComplete);
+        TStatusCb onComplete);
+    bool GetDeviceInfo(TStatusCb onComplete);
+    bool SetDeviceOn(bool on, TStatusCb onComplete);
 
     // Each message starts with state 0xAB; decryption advances on ciphertext.
     static LString XorEncrypt(const void *data, size_t size);

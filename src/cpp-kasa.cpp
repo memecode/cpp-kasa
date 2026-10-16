@@ -122,7 +122,7 @@ void LKasaProtocol::SetCredentials(const char *username, const char *password)
 	Password.Set(username && password ? password : nullptr);
 }
 
-bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, const TStatusCb &onComplete)
+bool LKasaProtocol::Enqueue(std::function<bool(LString &, int)> operation, TStatusCb onComplete)
 {
 	std::lock_guard<std::mutex> lock(QueueMutex);
 	if (Stopping)
@@ -187,7 +187,7 @@ void LKasaProtocol::WorkerLoop()
 	}
 }
 
-bool LKasaProtocol::Connect(const char *host, const TStatusCb &onComplete, int port)
+bool LKasaProtocol::Connect(const char *host, TStatusCb onComplete, int port)
 {
 	if (!onComplete)
 		return false;
@@ -248,7 +248,7 @@ LError LKasaProtocol::GetError() const
 }
 
 bool LKasaProtocol::Discover(const TDeviceCb &onDevice, const char *targetIp,
-	const TStatusCb &onComplete)
+	TStatusCb onComplete)
 {
 	if (!onDevice)
 		return false;
@@ -283,7 +283,9 @@ bool LKasaProtocol::DiscoverSync(const TDeviceCb &onDevice, const char *targetIp
 		if (modern)
 			modernIps.New() = device.Ip;
 		foundDevice = true;
-		onDevice(device);
+		LKasaDevice discovered = device;
+		discovered.isSmart = modern;
+		onDevice(discovered);
 	};
 	LKasaProtocol legacyProtocol;
 	LKasaProtocol modernProtocol;
@@ -689,7 +691,7 @@ LString LKasaProtocol::XorDecrypt(const void *data, size_t size)
 	return TransformXor(data, size, true);
 }
 
-bool LKasaProtocol::Request(const char *requestJson, const TStatusCb &onComplete)
+bool LKasaProtocol::Request(const char *requestJson, TStatusCb onComplete)
 {
 	if (!onComplete)
 		return false;
@@ -783,12 +785,12 @@ bool LKasaProtocol::RequestSync(const char *requestJson, LString &responseJson)
 	return true;
 }
 
-bool LKasaProtocol::GetSysInfo(const TStatusCb &onComplete)
+bool LKasaProtocol::GetSysInfo(TStatusCb onComplete)
 {
 	return Request("{\"system\":{\"get_sysinfo\":{}}}", onComplete);
 }
 
-bool LKasaProtocol::SetRelayState(bool on, const TStatusCb &onComplete)
+bool LKasaProtocol::SetRelayState(bool on, TStatusCb onComplete)
 {
 	return on
 		? Request("{\"system\":{\"set_relay_state\":{\"state\":1}}}", onComplete)

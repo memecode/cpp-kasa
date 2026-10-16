@@ -104,11 +104,19 @@ class App : public LWindow
     {
         App *app = nullptr;
         LKasaDevice device;
+        LString msg;
         LListItemCheckBox *val = nullptr;
-        LAutoPtr<LKasaProtocol> tapo;
-        LAutoPtr<LKasaProtocol> legacy;
+        
+        LAutoPtr<LKasaProtocol> kasa;
+
+        enum TState {
+            TInit,
+            TIdle,
+            TSwitching,
+            TCompleting
+        }   state = TInit;
+
         bool relayState = false;
-        bool switching = false;
         bool requestedState = false;
         std::shared_ptr<int> lifetime = std::make_shared<int>(0);
 
@@ -122,12 +130,16 @@ class App : public LWindow
                     return;
                 if (success)
                 {
-                    device.Response.Set(text.c_str());
+                    device.Response = text.c_str();
                     LJson info(device.Response);
-                    LString state = info.Get("result.device_on");
-                    relayState = state.Equals("true", false) || state.Equals("1", false);
-                    if (!switching)
+                    LString device_on = info.Get("result.device_on");
+                    relayState = device_on.Equals("true", false) || device_on.Equals("1", false);
+                    if (state != TSwitching)
+                    {
+                        state = TSwitching;
                         val->Value(relayState);
+                        state = TIdle;
+                    }
                     LString nickname = info.Get("result.nickname");
                     device.Name.Empty();
                     if (nickname && nickname.Length() % 4 == 0)
@@ -146,144 +158,172 @@ class App : public LWindow
                         }
                     }
                     if (!device.Name)
-                        device.Name.Set(device.Ip.Get());
+                        device.Name = device.Ip;
+                    msg.Empty();
                 }
                 else
-                    device.Name.Printf("Error: %s", text.c_str());
+                    msg.Printf("Error: %s", text.c_str());
                 Update();
                 app->lst->ResizeColumnsToContent();
             }, _FL);
         }
 
+        void SetMsg(LString m = LString())
+        {
+            msg = m;
+            Update();
+            app->lst->ResizeColumnsToContent();
+        }
+
+        void Connect(LKasaProtocol::TStatusCb callback)
+        {
+            if (kasa && kasa->IsConnected())
+            {
+                callback(true, "Already connected");
+            }
+            else if (kasa.Reset(new LKasaProtocol(app->kasa)))
+            {
+                SetMsg(LString::Fmt("..connecting: %i", device.isSmart));
+
+                if (device.isSmart)
+                {
+                    if (!kasa->ConnectSmart(device, callback))
+                        callback(false, "ConnectSmart failed");
+                }
+                else
+                {
+                    if (!kasa->Connect(device.Ip, callback))
+                        callback(false, "Connect failed");
+                }
+            }
+        }
+
         KasaDeviceItem(App *a, const LKasaDevice &dev)
             : app(a)
         {
-            device.Ip.Set(dev.Ip.Get());
-            device.Name.Set(dev.Name.Get());
-            device.Response.Set(dev.Response.Get());
-            LJson json(device.Response);
-            
+            device = dev;
+
+            LJson json(device.Response);            
             device.Name = json.Get("system.get_sysinfo.alias");
             if (!device.Name)
                 device.Name = json.Get("system.get_sysinfo.system.alias");
-            if (!device.Name)
+
+            // SetMsg(LString::Fmt("device.isSmart=%i", device.isSmart));
+            if (device.isSmart)
             {
-                // Maybe its a Tapo device?
-                if (tapo.Reset(new LKasaProtocol(app->kasa)))
-                {
-                    printf("Attempting to connect to Tapo device at IP: %s\n", device.Ip.Get());
-                    device.Name = "..connecting..";
-                    bool queued = tapo->ConnectSmart(device, [this](bool status, const LString &str)
+                Connect
+                (
+                    [this](bool status, auto str)
                     {
                         if (!status)
-                        {
-                            ShowResult(false, str);
-                            return;
-                        }
-                        if (!tapo->GetDeviceInfo([this](bool success, const LString &response)
-                        {
-                            ShowResult(success, response);
-                        }))
-                            ShowResult(false, LString("Device info request was not queued"));
-                    });
-                    if (!queued)
-                        device.Name = "Error: Connection was not queued";
-                }
+                            SetMsg(LString::Fmt("Error: %s", str.Get()));
+                        else if
+                        (
+                            kasa->GetDeviceInfo
+                            (
+                                [this](bool success, auto response)
+                                {
+                                    ShowResult(success, response);
+                                }
+                            )
+                        )
+                            SetMsg("..device info..");
+                        else
+                            SetMsg("error: GetDeviceInfo");
+                    }
+                );
             }
 
-            LString state = json.Get("system.get_sysinfo.relay_state");
-            if (!state)
-                state = json.Get("system.get_sysinfo.system.relay_state");
-            relayState = state.Equals("1", false);
+            LString relay_state = json.Get("system.get_sysinfo.relay_state");
+            if (!relay_state)
+                relay_state = json.Get("system.get_sysinfo.system.relay_state");
+            relayState = relay_state.Equals("1", false);
             val = new LListItemCheckBox(this, 1, relayState);
+
+            state = TIdle;
         }
 
         ~KasaDeviceItem() override
         {
-            tapo.Reset();
-            legacy.Reset();
+            kasa.Reset();
             lifetime.reset();
+        }
+
+        const char *displayName() const
+        {
+            return device.Name ? device.Name : device.Ip;
         }
 
         const char *GetText(int col) override
         {
             switch (col)
             {
-                case 0: return device.Name;
+                case 0: return displayName();
+                case 2: return msg;
             }
             return nullptr;
         }
 
         void OnColumnNotify(int col, int64 data) override
         {
-            if (col != 1)
+            if (col != 1 || state != TIdle)
             {
-                LListItem::OnColumnNotify(col, data);
-                return;
-            }
-            if (switching)
-            {
-                val->Value(requestedState);
-                Update();
+                printf("%s:%i - '%s' state not idle (state=%i)\n", _FL, displayName(), state);
                 return;
             }
 
             bool on = data != 0;
             requestedState = on;
-            switching = true;
-            Update();
-            auto complete = [this, on](bool success, const LString &response)
+            state = TSwitching;
+
+            auto complete = [this, on](bool success, LString response)
             {
-                if (success && !tapo)
+                if (success && !device.isSmart)
                 {
                     LJson result(response);
                     LString code = result.Get("system.set_relay_state.err_code");
                     if (code && !code.Equals("0", false))
                         success = false;
                 }
-                std::string text = response.Get() ? response.Get() : "";
                 std::weak_ptr<int> alive = lifetime;
-                LAppInst->RunCallback([this, alive, on, success, text]()
-                {
-                    if (alive.expired())
-                        return;
-                    switching = false;
-                    if (success)
-                        relayState = on;
-                    else
+                LAppInst->RunCallback([this, alive, on, success, response]()
                     {
-                        LString error;
-                        error.Printf("Failed to switch %s: %s", device.Ip.Get(), text.c_str());
-                        app->log->Name(error);
-                    }
-                    val->Value(relayState);
-                    Update();
-                }, _FL);
+                        if (alive.expired())
+                            return;
+                        if (success)
+                        {
+                            state = TCompleting; // stops OnColumnNotify recursion
+                            val->Value(on);
+                            SetMsg("ok");
+                        }
+                        else
+                        {
+                            SetMsg("Failed to switch");
+                            app->log->Write(response);
+                        }
+                        state = TIdle;
+                        Update();
+                    },
+                    _FL);
             };
 
-            if (tapo)
-            {
-                if (!tapo->SetDeviceOn(on, complete))
-                    complete(false, LString("Switch command was not queued"));
-            }
-            else
-            {
-                if (!legacy)
-                    legacy.Reset(new LKasaProtocol(app->kasa));
-                if (legacy->IsConnected())
+            Connect
+            (
+                [this, complete, on](auto status, auto str)
                 {
-                    if (!legacy->SetRelayState(on, complete))
-                        complete(false, LString("Switch command was not queued"));
+                    SetMsg();
+                    if (device.isSmart)
+                    {
+                        if (!kasa->SetDeviceOn(on, complete))
+                            complete(false, "SetDeviceOn failed");
+                    }
+                    else
+                    {
+                        if (!kasa->SetRelayState(on, complete))
+                            complete(false, "SetRelayState failed");
+                    }
                 }
-                else if (!legacy->Connect(device.Ip, [this, on, complete](bool success, const LString &response)
-                {
-                    if (!success)
-                        complete(false, response);
-                    else if (!legacy->SetRelayState(on, complete))
-                        complete(false, LString("Switch command was not queued"));
-                }))
-                    complete(false, LString("Connection was not queued"));
-            }
+            );
         }
     };
 
@@ -324,6 +364,7 @@ public:
         box->AddView(lst = new LList(ID_LIST));
             lst->AddColumn("Name");
             lst->AddColumn("Switch");
+            lst->AddColumn("Msg");
         box->AddView(log = new LTextLog(ID_LOG));
         
         AttachChildren();
@@ -334,18 +375,16 @@ public:
         std::weak_ptr<int> alive = lifetime;
         kasa.Discover([this, alive](const LKasaDevice &device)
             {
-                std::string ip = device.Ip.Get() ? device.Ip.Get() : "";
-                std::string response = device.Response.Get() ? device.Response.Get() : "";
-                LAppInst->RunCallback([this, alive, ip, response]()
+                LKasaDevice dev = device;
+                LAppInst->RunCallback([this, alive, dev]()
                 {
                     if (alive.expired())
                         return;
-                    LKasaDevice copy;
-                    copy.Ip.Set(ip.c_str());
-                    copy.Response.Set(response.c_str());
-                    auto item = new KasaDeviceItem(this, copy);
-                    lst->Insert(item);
-                    lst->ResizeColumnsToContent();
+                    if (auto item = new KasaDeviceItem(this, dev))
+                    {
+                        lst->Insert(item);
+                        lst->ResizeColumnsToContent();
+                    }
                 }, _FL);
             });
 	}

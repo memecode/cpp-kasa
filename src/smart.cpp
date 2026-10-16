@@ -993,7 +993,7 @@ void LKasaProtocol::ApplyTimeout(int timeoutMs)
 		Smart->TimeoutMs = timeoutMs;
 }
 
-bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const TStatusCb &onComplete)
+bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, TStatusCb onComplete)
 {
 	LString user, secret;
 	{
@@ -1004,7 +1004,7 @@ bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const TStatusCb &onC
 	return ConnectSmart(device, user.Get(), secret.Get(), onComplete);
 }
 
-bool LKasaProtocol::ConnectSmart(const char *host, const TStatusCb &onComplete)
+bool LKasaProtocol::ConnectSmart(const char *host, TStatusCb onComplete)
 {
 	LString user, secret;
 	{
@@ -1016,7 +1016,7 @@ bool LKasaProtocol::ConnectSmart(const char *host, const TStatusCb &onComplete)
 }
 
 bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const char *username,
-	const char *password, const TStatusCb &onComplete)
+	const char *password, TStatusCb onComplete)
 {
 	if (!onComplete)
 		return false;
@@ -1036,7 +1036,7 @@ bool LKasaProtocol::ConnectSmart(const LKasaDevice &device, const char *username
 }
 
 bool LKasaProtocol::ConnectSmart(const char *host, const char *username,
-	const char *password, const TStatusCb &onComplete)
+	const char *password, TStatusCb onComplete)
 {
 	if (!onComplete)
 		return false;
@@ -1244,7 +1244,7 @@ bool LKasaProtocol::SmartRequest(const char *method, const char *paramsJson, LSt
 	return true;
 }
 
-bool LKasaProtocol::GetDeviceInfo(const TStatusCb &onComplete)
+bool LKasaProtocol::GetDeviceInfo(TStatusCb onComplete)
 {
 	if (!onComplete)
 		return false;
@@ -1254,7 +1254,7 @@ bool LKasaProtocol::GetDeviceInfo(const TStatusCb &onComplete)
 	}, onComplete);
 }
 
-bool LKasaProtocol::SetDeviceOn(bool on, const TStatusCb &onComplete)
+bool LKasaProtocol::SetDeviceOn(bool on, TStatusCb onComplete)
 {
 	if (!onComplete)
 		return false;
